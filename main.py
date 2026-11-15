@@ -19,6 +19,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+import traceback
 import tkinter as tk
 import urllib.request
 from tkinter import filedialog, messagebox, ttk
@@ -30,7 +31,7 @@ import i18n
 from i18n import num, t, vis
 
 APP_NAME = "AutoScribe"
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 
 # ---------------------------------------------------------------------------
 # Theme
@@ -109,6 +110,38 @@ DB_FILE = os.path.join(APP_PATH, "windscribe_results.db")
 CONFIG_FILE = os.path.join(APP_PATH, "config.json")
 LOCATIONS_FILE = os.path.join(APP_PATH, "locations.json")
 REPORTS_DIR = os.path.join(APP_PATH, "reports")
+LOG_FILE = os.path.join(APP_PATH, "autoscribe.log")
+
+_log_lock = threading.Lock()
+
+
+def log_file(msg):
+    """Appends one timestamped line to autoscribe.log (best effort, never raises).
+
+    The frozen build redirects stdout/stderr to devnull, so print() diagnostics
+    are invisible by design; this file is the only durable record of internal
+    errors. Safe to call from any thread.
+    """
+    try:
+        line = f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {msg}\n"
+        with _log_lock:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line)
+    except Exception:
+        pass
+
+
+def _trim_log_file():
+    """Keeps autoscribe.log bounded: on startup, keep only the last ~100 KB."""
+    try:
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 200 * 1024:
+            with open(LOG_FILE, "rb") as f:
+                f.seek(-100 * 1024, os.SEEK_END)
+                tail = f.read()
+            with open(LOG_FILE, "wb") as f:
+                f.write(tail)
+    except Exception:
+        pass
 
 DEFAULT_CLI = r"C:\Program Files\Windscribe\windscribe-cli.exe" if IS_WINDOWS else "windscribe-cli"
 # The public server list that windscribe.com/vpn-servers loads; same format as locations.json.
@@ -250,15 +283,20 @@ class ConfigManager:
             return loaded
         except Exception as e:
             print(f"Config Load Error: {e}")
+            log_file(f"Config Load Error: {e}")
             return default_data
 
     @staticmethod
     def save_config(data):
+        """Writes the config file; returns True on success (never raises)."""
         try:
             with open(CONFIG_FILE, "w") as f:
                 json.dump(data, f, indent=4)
+            return True
         except Exception as e:
             print(f"Config Save Error: {e}")
+            log_file(f"Config Save Error: {e}")
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -1448,6 +1486,7 @@ class App(ctk.CTk):
                     fn(*args, **kwargs)
                 except Exception as e:
                     print(f"UI error: {e}")
+                    log_file("UI error:\n" + traceback.format_exc())
         except queue.Empty:
             pass
         self.after(60, self._drain_ui_queue)
@@ -2585,38 +2624,57 @@ class App(ctk.CTk):
         self.after(35000, lambda g=gen: self._fav_watchdog(g))
 
         def work():
+            log_file("Favourites update started.")
             try:
                 fav_entries, all_entries = fetch_windscribe_lists(cli)
-                self.post(self.favourites_updated, gen, None, fav_entries, all_entries)
+                self.post(self.on_favourites_updated, gen, None, fav_entries, all_entries)
             except Exception as e:
-                self.post(self.favourites_updated, gen, str(e) or e.__class__.__name__, None, None)
+                self.post(self.on_favourites_updated, gen, str(e) or e.__class__.__name__, None, None)
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _restore_fav_buttons(self):
+        """Re-enables the update buttons; returns the live picker, if any.
+
+        Best effort: a dead widget is logged to the file log, never raised,
+        so a UI failure can never block the data path.
+        """
+        try:
+            self.btn_update_fav.configure(state="normal", text=t("update_favourites"))
+        except Exception:
+            log_file("Favourites update: sidebar button restore failed:\n" + traceback.format_exc())
+        try:
+            picker = self._picker if self._picker is not None and self._picker.winfo_exists() else None
+            if picker:
+                picker.btn_update_fav.configure(state="normal", text=t("update_favourites"))
+            return picker
+        except Exception:
+            log_file("Favourites update: picker button restore failed:\n" + traceback.format_exc())
+            return None
 
     def _fav_watchdog(self, gen):
         """Frees the update buttons if the CLI never answered."""
         if not getattr(self, "_updating_favourites", False) or gen != getattr(self, "_fav_gen", 0):
             return
         self._updating_favourites = False
-        self.btn_update_fav.configure(state="normal", text=t("update_favourites"))
-        if self._picker is not None and self._picker.winfo_exists():
-            self._picker.btn_update_fav.configure(state="normal", text=t("update_favourites"))
+        log_file("Favourites update timed out (35s watchdog).")
+        self._restore_fav_buttons()
         self.log_message("Favourites update timed out: windscribe-cli did not respond.", "FAILURE")
         self.toast(t("fav_timeout"), "error", ms=7000)
 
-    def favourites_updated(self, gen, error, fav_entries, all_entries):
+    def on_favourites_updated(self, gen, error, fav_entries, all_entries):
         if gen != getattr(self, "_fav_gen", 0) or not getattr(self, "_updating_favourites", False):
+            log_file("Favourites update: ignoring late result (watchdog already gave up).")
             return  # the watchdog already gave up; ignore this late result
         self._updating_favourites = False
-        self.btn_update_fav.configure(state="normal", text=t("update_favourites"))
-        picker = self._picker if self._picker is not None and self._picker.winfo_exists() else None
-        if picker:
-            picker.btn_update_fav.configure(state="normal", text=t("update_favourites"))
         if error:
+            log_file(f"Favourites update failed: {error}")
+            self._restore_fav_buttons()
             self.log_message(f"Favourites update failed: {error}", "FAILURE")
             self.toast(t("fav_failed", e=error), "error", ms=7000)
             return
 
+        # Compute and persist FIRST: a widget failure below must never lose data.
         fav_keys, fav_unmatched = match_cli_entries(fav_entries, self.locations)
         usable = [e for e in all_entries if not e["pro"] and not e["disabled"]]
         free_keys, _free_unmatched = match_cli_entries(usable, self.locations)
@@ -2626,10 +2684,26 @@ class App(ctk.CTk):
         self.config_data["favourites"] = sorted(self.favourite_keys)
         self.config_data["free_servers"] = sorted(self.free_keys)
         self.config_data["favourites_updated"] = self.favourites_updated
-        self.save_all_config()
-        self.refresh_locations_info()
+        saved = self.write_config()
+        log_file(f"Favourites updated: {len(self.favourite_keys)} liked, "
+                 f"{len(self.free_keys)} usable, {len(fav_unmatched)} unmatched, saved={saved}.")
+        if fav_unmatched:
+            log_file("Favourites unmatched: " + ", ".join(fav_unmatched))
+
+        # UI updates last, each independent: one failing widget cannot hide the rest.
+        picker = self._restore_fav_buttons()
+        if not saved:
+            self.toast(t("fav_failed", e="config.json"), "error", ms=7000)
+            return
+        try:
+            self.refresh_locations_info()
+        except Exception:
+            log_file("Favourites update: refresh_locations_info failed:\n" + traceback.format_exc())
         if picker:
-            picker.render()
+            try:
+                picker.render()
+            except Exception:
+                log_file("Favourites update: picker render failed:\n" + traceback.format_exc())
 
         if not fav_entries:
             self.toast(t("fav_empty"), "warn", ms=6000)
@@ -2897,7 +2971,15 @@ class App(ctk.CTk):
         self.config_data["last_settings"] = self.gather_config_data()
         self.config_data["cli_path"] = self.entry_cli.get().strip()
         self.config_data["sidebar_open"] = self.sidebar_open
-        ConfigManager.save_config(self.config_data)
+        return self.write_config()
+
+    def write_config(self):
+        """Writes config_data to disk without reading any widget.
+
+        Used by paths (like the favourites update) whose data must survive
+        even if the UI is mid-teardown. Returns whether the write succeeded.
+        """
+        return ConfigManager.save_config(self.config_data)
 
     def ask_profile_name(self):
         d = ctk.CTkToplevel(self)
@@ -3177,12 +3259,28 @@ class App(ctk.CTk):
             if not ask_yes_no(self, t("quit"), t("quit_q")):
                 return
             self.worker.stop_event.set()
+        # A result that already arrived must not be lost to the shutdown:
+        # process whatever the worker threads already posted, without waiting.
+        drained = 0
+        try:
+            while drained < 50:
+                fn, args, kwargs = self._ui_queue.get_nowait()
+                try:
+                    fn(*args, **kwargs)
+                except Exception:
+                    log_file("UI error on close:\n" + traceback.format_exc())
+                drained += 1
+        except queue.Empty:
+            pass
+        if drained:
+            log_file(f"Close: drained {drained} pending UI update(s).")
         try:
             if self.state() == "normal":
                 self.config_data["window"] = self.geometry()
             self.save_all_config()
         except Exception as e:
             print(f"Close Error: {e}")
+            log_file(f"Close Error: {e}")
         self.destroy()
 
 
@@ -3203,6 +3301,7 @@ def restart():
 
 
 def main():
+    _trim_log_file()
     app = App()
     app.mainloop()
     if app.relaunch:
