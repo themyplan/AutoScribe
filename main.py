@@ -30,7 +30,7 @@ import i18n
 from i18n import num, t, vis
 
 APP_NAME = "AutoScribe"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 # ---------------------------------------------------------------------------
 # Theme
@@ -236,7 +236,8 @@ class ConfigManager:
     @staticmethod
     def load_config():
         default_data = {"saved_profiles": {}, "last_settings": ConfigManager.default_settings(),
-                        "cli_path": DEFAULT_CLI, "window": "", "sidebar_open": True, "language": ""}
+                        "cli_path": DEFAULT_CLI, "window": "", "sidebar_open": True, "language": "",
+                        "favourites": [], "free_servers": [], "favourites_updated": ""}
         if not os.path.exists(CONFIG_FILE):
             return default_data
         try:
@@ -326,6 +327,89 @@ class LocationManager:
             return datetime.datetime.fromtimestamp(os.path.getmtime(LOCATIONS_FILE))
         except OSError:
             return None
+
+
+# ---------------------------------------------------------------------------
+# Favourites / free servers (read from the Windscribe app on this computer)
+#
+# `windscribe-cli locations fav` prints the liked servers, one per line:
+#   City - Nickname [(Pro)] [(10 Gbps)] [pinned IP]
+# `windscribe-cli locations` prints every server, with "(Pro)" on the ones
+# the current account cannot use and "(Disabled)" on unavailable ones:
+#   Region - City - Nickname [(Pro)] [(10 Gbps)]
+# ---------------------------------------------------------------------------
+_CLI_SUFFIX_RE = re.compile(r"\s*\([^()]*\)\s*$")
+_CLI_IP_RE = re.compile(r"\s+\d{1,3}(?:\.\d{1,3}){3}\s*$")
+
+
+def parse_cli_locations(text):
+    """Parses `windscribe-cli locations [fav]` output into dicts.
+
+    Returns a list of {"region", "city", "nick", "pro", "disabled"}.
+    """
+    entries = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        pro = "(Pro)" in line
+        disabled = "(Disabled)" in line
+        while _CLI_SUFFIX_RE.search(line):
+            line = _CLI_SUFFIX_RE.sub("", line).strip()
+        line = _CLI_IP_RE.sub("", line).strip()
+        parts = [p.strip() for p in line.split(" - ")]
+        if len(parts) == 3:
+            region, city, nick = parts
+        elif len(parts) == 2:
+            region, city, nick = "", parts[0], parts[1]
+        else:
+            continue
+        if not city or not nick:
+            continue
+        entries.append({"region": region, "city": city, "nick": nick, "pro": pro, "disabled": disabled})
+    return entries
+
+
+def match_cli_entries(entries, locations):
+    """Matches parsed CLI entries to loaded locations by city + server name.
+
+    The CLI's region (e.g. "US Central") is used only to break ties between
+    servers that share a city and nickname. Returns (loc_keys, unmatched
+    display names).
+    """
+    by_name = {}
+    for l in locations:
+        by_name.setdefault((l["city"].lower(), l["location"].lower()), []).append(l)
+    keys, unmatched = set(), []
+    for e in entries:
+        candidates = by_name.get((e["city"].lower(), e["nick"].lower()))
+        if not candidates:
+            unmatched.append(f"{e['city']} - {e['nick']}")
+            continue
+        pick = next((l for l in candidates if e["region"] and l["country"].lower() == e["region"].lower()),
+                    candidates[0])
+        keys.add(loc_key(pick))
+    return keys, unmatched
+
+
+def fetch_windscribe_lists(cli_cmd):
+    """Runs the CLI twice; returns (favourite entries, all-location entries).
+
+    Raises on a CLI failure or on an empty full list (the full list can never
+    legitimately be empty). An empty favourites list is valid: it just means
+    no servers were liked yet.
+    """
+    def run(args, allow_empty=False):
+        result = subprocess.run([cli_cmd] + args, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=30,
+                                **hidden_process_kwargs())
+        out = (result.stdout or "").strip()
+        if result.returncode != 0 or (not out and not allow_empty):
+            raise RuntimeError(out or f"windscribe-cli {' '.join(args)} returned no output")
+        return out
+
+    return parse_cli_locations(run(["locations", "fav"], allow_empty=True)), \
+        parse_cli_locations(run(["locations"]))
 
 
 # ---------------------------------------------------------------------------
@@ -994,6 +1078,7 @@ class LocationPicker(ctk.CTkToplevel):
         self.app, self.on_done = app, on_done
         self.selected = set(selected)
         self.region = "All"
+        self.list_filter = None
         self.item_keys = {}
         self.country_items = set()
 
@@ -1010,6 +1095,10 @@ class LocationPicker(ctk.CTkToplevel):
                                        width=app.text_width(t("updating"), sans(12)) + 28, height=30)
         self.btn_update.pack(side=end())
         Tooltip(self.btn_update, t("update_tip"))
+        self.btn_update_fav = ghost_button(title_row, t("update_favourites"), app.update_favourites,
+                                           width=app.text_width(t("update_favourites"), sans(12)) + 28, height=30)
+        self.btn_update_fav.pack(side=end(), padx=pads(0, 8))
+        Tooltip(self.btn_update_fav, t("update_fav_tip"))
         label(head, t("picker_hint"), 11, MUTED, wraplength=500).pack(anchor=a_start(), fill="x", pady=(2, 0))
 
         self.entry = entry(self, height=40, size=13, placeholder_text=t("search_locations"))
@@ -1043,6 +1132,14 @@ class LocationPicker(ctk.CTkToplevel):
 
         self.lbl_count = label(self, "", 12, TEXT_2)
         self.lbl_count.pack(fill="x", padx=24, pady=(10, 0))
+        filt = frame(self)
+        filt.pack(fill="x", padx=22, pady=(8, 0))
+        self.btn_fav_filter = ghost_button(filt, t("favourites"), lambda: self.set_list_filter("fav"),
+                                           width=app.text_width(t("favourites"), sans(12)) + 28, height=32)
+        self.btn_fav_filter.pack(side=start())
+        self.btn_free_filter = ghost_button(filt, t("free_servers"), lambda: self.set_list_filter("free"),
+                                            width=app.text_width(t("free_servers"), sans(12)) + 28, height=32)
+        self.btn_free_filter.pack(side=start(), padx=pads(6, 0))
         foot = frame(self)
         foot.pack(fill="x", padx=22, pady=(8, 18))
         ghost_button(foot, t("select_shown"), self.select_shown,
@@ -1089,6 +1186,10 @@ class LocationPicker(ctk.CTkToplevel):
         out = []
         for country, locs in self.by_country.items():
             locs = [l for l in locs if matches_region(l, self.region)]
+            if self.list_filter == "fav":
+                locs = [l for l in locs if loc_key(l) in self.app.favourite_keys]
+            elif self.list_filter == "free":
+                locs = [l for l in locs if loc_key(l) in self.app.free_keys]
             if not locs:
                 continue
             if tokens:
@@ -1141,6 +1242,26 @@ class LocationPicker(ctk.CTkToplevel):
                         border_color=ACCENT_LINE if active else BORDER_2,
                         text_color=TEXT if active else TEXT_2)
         self.render()
+
+    def set_list_filter(self, mode):
+        """Toggles the favourites / free-servers view filter (tap again to clear)."""
+        if self.list_filter == mode:
+            self.list_filter = None
+        else:
+            keys = self.app.favourite_keys if mode == "fav" else self.app.free_keys
+            if not keys:
+                self.app.toast(t("no_fav_yet" if mode == "fav" else "no_free_yet"), "warn")
+                return
+            self.list_filter = mode
+        self._paint_list_filter()
+        self.render()
+
+    def _paint_list_filter(self):
+        for mode, b in (("fav", self.btn_fav_filter), ("free", self.btn_free_filter)):
+            active = self.list_filter == mode
+            b.configure(fg_color=ACCENT_SOFT if active else CARD,
+                        border_color=ACCENT_LINE if active else BORDER_2,
+                        text_color=TEXT)
 
     # -- interaction --
     def _on_search(self, event):
@@ -1273,6 +1394,9 @@ class App(ctk.CTk):
         self.current_profile_name = "Manual"
         self.locations = LocationManager.load_locations()
         self.all_keys = {loc_key(l) for l in self.locations}
+        self.favourite_keys = set(self.config_data.get("favourites") or []) & self.all_keys
+        self.free_keys = set(self.config_data.get("free_servers") or []) & self.all_keys
+        self.favourites_updated = self.config_data.get("favourites_updated") or ""
         self.selected_keys = set()
         self.sidebar_open = bool(self.config_data.get("sidebar_open", True))
 
@@ -1460,13 +1584,20 @@ class App(ctk.CTk):
 
         # --- Locations ---
         lh = frame(scroll)
-        lh.pack(fill="x", padx=px, pady=(20, 6))
+        lh.pack(fill="x", padx=px, pady=(20, 0))
         caps(lh, t("locations")).pack(side=start())
         self.btn_update_list = ctk.CTkButton(lh, text=t("update_list"), command=self.update_locations, width=20,
                                              height=20, fg_color="transparent", hover_color=HOVER,
                                              text_color=ACCENT, text_color_disabled=MUTED, font=sans(11))
         self.btn_update_list.pack(side=end())
         self.tip_update_list = Tooltip(self.btn_update_list, "")
+        lh2 = frame(scroll)
+        lh2.pack(fill="x", padx=px, pady=(2, 6))
+        self.btn_update_fav = ctk.CTkButton(lh2, text=t("update_favourites"), command=self.update_favourites,
+                                             width=20, height=20, fg_color="transparent", hover_color=HOVER,
+                                             text_color=ACCENT, text_color_disabled=MUTED, font=sans(11))
+        self.btn_update_fav.pack(side=end())
+        self.tip_update_fav = Tooltip(self.btn_update_fav, "")
         sc = ctk.CTkFrame(scroll, fg_color=INPUT, corner_radius=10, border_width=1, border_color=BORDER_2)
         sc.pack(fill="x", padx=px)
         sc.grid_columnconfigure(gcol(0, 2), weight=1)
@@ -2354,6 +2485,8 @@ class App(ctk.CTk):
         updated = LocationManager.last_updated()
         self.tip_update_list.text = t("update_tip") + "\n" + (
             t("current_list", d=updated.strftime("%Y-%m-%d %H:%M")) if updated else t("no_list_yet"))
+        self.tip_update_fav.text = t("update_fav_tip") + "\n" + (
+            t("fav_current", d=self.favourites_updated) if self.favourites_updated else t("fav_never"))
         if self.locations:
             self.lbl_no_locations.pack_forget()
         else:
@@ -2395,6 +2528,10 @@ class App(ctk.CTk):
         added, removed = len(self.all_keys - old_keys), len(old_keys - self.all_keys)
         had_selection = bool(self.selected_keys)
         self.selected_keys &= self.all_keys
+        self.favourite_keys &= self.all_keys
+        self.free_keys &= self.all_keys
+        self.config_data["favourites"] = sorted(self.favourite_keys)
+        self.config_data["free_servers"] = sorted(self.free_keys)
         if picker:
             picker.set_locations(self.locations)
         self.refresh_locations_info()
@@ -2411,6 +2548,65 @@ class App(ctk.CTk):
             msg += t("selection_gone")
         self.log_message(f"Server list updated: {len(self.locations)} servers, {added} new, {removed} removed.",
                          "SUCCESS")
+        self.toast(msg, "success", ms=6000)
+
+    def update_favourites(self):
+        """Re-reads the liked servers and the usable servers from Windscribe."""
+        if getattr(self, "_updating_favourites", False):
+            return
+        cli = resolve_cli(self.entry_cli.get())
+        if not cli:
+            self.toast(t("fav_no_cli"), "warn")
+            return
+        self._updating_favourites = True
+        buttons = [self.btn_update_fav]
+        if self._picker is not None and self._picker.winfo_exists():
+            buttons.append(self._picker.btn_update_fav)
+        for b in buttons:
+            b.configure(state="disabled", text=t("updating"))
+
+        def work():
+            try:
+                fav_entries, all_entries = fetch_windscribe_lists(cli)
+                self.post(self.favourites_updated, None, fav_entries, all_entries)
+            except Exception as e:
+                self.post(self.favourites_updated, str(e) or e.__class__.__name__, None, None)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def favourites_updated(self, error, fav_entries, all_entries):
+        self._updating_favourites = False
+        self.btn_update_fav.configure(state="normal", text=t("update_favourites"))
+        picker = self._picker if self._picker is not None and self._picker.winfo_exists() else None
+        if picker:
+            picker.btn_update_fav.configure(state="normal", text=t("update_favourites"))
+        if error:
+            self.log_message(f"Favourites update failed: {error}", "FAILURE")
+            self.toast(t("fav_failed", e=error), "error", ms=7000)
+            return
+
+        fav_keys, fav_unmatched = match_cli_entries(fav_entries, self.locations)
+        usable = [e for e in all_entries if not e["pro"] and not e["disabled"]]
+        free_keys, _free_unmatched = match_cli_entries(usable, self.locations)
+        self.favourite_keys = fav_keys & self.all_keys
+        self.free_keys = free_keys & self.all_keys
+        self.favourites_updated = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        self.config_data["favourites"] = sorted(self.favourite_keys)
+        self.config_data["free_servers"] = sorted(self.free_keys)
+        self.config_data["favourites_updated"] = self.favourites_updated
+        self.save_all_config()
+        self.refresh_locations_info()
+        if picker:
+            picker.render()
+
+        if not fav_entries:
+            self.toast(t("fav_empty"), "warn", ms=6000)
+            return
+        msg = t("fav_updated", f=num(len(self.favourite_keys)), r=num(len(self.free_keys)))
+        if fav_unmatched:
+            msg += " " + t("fav_unmatched", n=num(len(fav_unmatched)))
+        self.log_message(f"Favourites updated: {len(self.favourite_keys)} liked, "
+                         f"{len(self.free_keys)} usable, {len(fav_unmatched)} unmatched.", "SUCCESS")
         self.toast(msg, "success", ms=6000)
 
     def on_locations_chosen(self, keys):
