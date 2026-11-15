@@ -30,7 +30,7 @@ import i18n
 from i18n import num, t, vis
 
 APP_NAME = "AutoScribe"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 
 # ---------------------------------------------------------------------------
 # Theme
@@ -400,11 +400,26 @@ def fetch_windscribe_lists(cli_cmd):
     no servers were liked yet.
     """
     def run(args, allow_empty=False):
-        result = subprocess.run([cli_cmd] + args, capture_output=True, text=True,
-                                encoding="utf-8", errors="replace", timeout=30,
-                                **hidden_process_kwargs())
-        out = (result.stdout or "").strip()
-        if result.returncode != 0 or (not out and not allow_empty):
+        # Popen + communicate with a hard timeout. subprocess.run()'s timeout
+        # kills the child but then waits forever reaping pipes if another
+        # process inherited them; the Windscribe CLI wedges exactly this way
+        # when its engine is stuck. stdin is DEVNULL so the CLI can never
+        # block reading input, and a second short wait after kill() is
+        # abandoned rather than trusted.
+        proc = subprocess.Popen([cli_cmd] + args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                stdin=subprocess.DEVNULL, text=True,
+                                encoding="utf-8", errors="replace", **hidden_process_kwargs())
+        try:
+            out, _ = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass  # a wedged helper still holds the pipes; abandon them
+            raise RuntimeError(f"windscribe-cli {' '.join(args)} did not respond")
+        out = (out or "").strip()
+        if proc.returncode != 0 or (not out and not allow_empty):
             raise RuntimeError(out or f"windscribe-cli {' '.join(args)} returned no output")
         return out
 
@@ -2559,22 +2574,39 @@ class App(ctk.CTk):
             self.toast(t("fav_no_cli"), "warn")
             return
         self._updating_favourites = True
+        self._fav_gen = getattr(self, "_fav_gen", 0) + 1
+        gen = self._fav_gen
         buttons = [self.btn_update_fav]
         if self._picker is not None and self._picker.winfo_exists():
             buttons.append(self._picker.btn_update_fav)
         for b in buttons:
             b.configure(state="disabled", text=t("updating"))
+        # Give-up timer: if the CLI wedges, the buttons must never stay stuck.
+        self.after(35000, lambda g=gen: self._fav_watchdog(g))
 
         def work():
             try:
                 fav_entries, all_entries = fetch_windscribe_lists(cli)
-                self.post(self.favourites_updated, None, fav_entries, all_entries)
+                self.post(self.favourites_updated, gen, None, fav_entries, all_entries)
             except Exception as e:
-                self.post(self.favourites_updated, str(e) or e.__class__.__name__, None, None)
+                self.post(self.favourites_updated, gen, str(e) or e.__class__.__name__, None, None)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def favourites_updated(self, error, fav_entries, all_entries):
+    def _fav_watchdog(self, gen):
+        """Frees the update buttons if the CLI never answered."""
+        if not getattr(self, "_updating_favourites", False) or gen != getattr(self, "_fav_gen", 0):
+            return
+        self._updating_favourites = False
+        self.btn_update_fav.configure(state="normal", text=t("update_favourites"))
+        if self._picker is not None and self._picker.winfo_exists():
+            self._picker.btn_update_fav.configure(state="normal", text=t("update_favourites"))
+        self.log_message("Favourites update timed out: windscribe-cli did not respond.", "FAILURE")
+        self.toast(t("fav_timeout"), "error", ms=7000)
+
+    def favourites_updated(self, gen, error, fav_entries, all_entries):
+        if gen != getattr(self, "_fav_gen", 0) or not getattr(self, "_updating_favourites", False):
+            return  # the watchdog already gave up; ignore this late result
         self._updating_favourites = False
         self.btn_update_fav.configure(state="normal", text=t("update_favourites"))
         picker = self._picker if self._picker is not None and self._picker.winfo_exists() else None
